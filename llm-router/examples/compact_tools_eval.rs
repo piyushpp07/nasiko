@@ -404,9 +404,9 @@ fn error_detail(error: &CompactError) -> String {
 // ── Live mode ───────────────────────────────────────────────────────────────────
 
 struct LiveClient {
-    endpoint: String,
+    endpoint: reqwest::Url,
     model: String,
-    api_key: Option<String>,
+    api_key: String,
     client: reqwest::Client,
     runtime: tokio::runtime::Runtime,
 }
@@ -419,11 +419,15 @@ struct LiveOutcome {
 
 impl LiveClient {
     fn from_env() -> AppResult<Option<Self>> {
-        let non_empty = |key| env::var(key).ok().filter(|value| !value.is_empty());
+        let non_empty = |key| env::var(key).ok().filter(|value| !value.trim().is_empty());
         let (Some(base_url), Some(model)) = (non_empty("PROVIDER_BASE_URL"), non_empty("MODEL"))
         else {
             return Ok(None);
         };
+        let api_key = non_empty("PROVIDER_API_KEY").ok_or_else(|| {
+            "PROVIDER_API_KEY must be set when PROVIDER_BASE_URL and MODEL enable live mode"
+                .to_string()
+        })?;
         let timeout = non_empty("LIVE_TIMEOUT_SECS")
             .map(|secs| {
                 secs.parse::<u64>()
@@ -440,9 +444,9 @@ impl LiveClient {
             .build()
             .map_err(|error| format!("could not start runtime: {error}"))?;
         Ok(Some(Self {
-            endpoint: format!("{}/chat/completions", base_url.trim_end_matches('/')),
+            endpoint: chat_completions_url(&base_url)?,
             model,
-            api_key: non_empty("PROVIDER_API_KEY"),
+            api_key,
             client,
             runtime,
         }))
@@ -464,30 +468,72 @@ impl LiveClient {
     }
 
     async fn complete(&self, compact_request: &Value) -> AppResult<String> {
-        let mut body = compact_request.clone();
-        body["model"] = json!(self.model);
-        body["temperature"] = json!(0);
-        let mut request = self.client.post(&self.endpoint).json(&body);
-        if let Some(key) = &self.api_key {
-            request = request.bearer_auth(key);
-        }
-        let response = request
+        let body = live_request_body(compact_request, &self.model)?;
+        let response = self
+            .client
+            .post(self.endpoint.clone())
+            .bearer_auth(&self.api_key)
+            .json(&body)
             .send()
             .await
-            .map_err(|e| format!("request failed: {e}"))?;
+            .map_err(provider_request_error)?;
         let status = response.status();
+        if !status.is_success() {
+            return Err(format!("provider returned HTTP {status}"));
+        }
         let payload: Value = response
             .json()
             .await
-            .map_err(|e| format!("invalid response body ({status}): {e}"))?;
-        if !status.is_success() {
-            return Err(format!("provider returned {status}: {payload}"));
-        }
-        Ok(payload["choices"][0]["message"]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string())
+            .map_err(|_| "provider returned malformed JSON".to_string())?;
+        payload
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| "provider response did not include assistant text".to_string())
     }
+}
+
+/// Make `/chat/completions` relative to a provider's OpenAI-compatible base
+/// URL while retaining a prefix such as `/openai/v1`.
+fn chat_completions_url(base_url: &str) -> AppResult<reqwest::Url> {
+    let mut base = reqwest::Url::parse(base_url)
+        .map_err(|_| "PROVIDER_BASE_URL must be a valid absolute URL".to_string())?;
+    if base.query().is_some() || base.fragment().is_some() {
+        return Err("PROVIDER_BASE_URL must not include a query string or fragment".into());
+    }
+    if base
+        .path()
+        .trim_end_matches('/')
+        .ends_with("/chat/completions")
+    {
+        return Ok(base);
+    }
+    let path = format!("{}/", base.path().trim_end_matches('/'));
+    base.set_path(&path);
+    base.join("chat/completions")
+        .map_err(|_| "could not construct provider chat completions endpoint".to_string())
+}
+
+fn provider_request_error(error: reqwest::Error) -> String {
+    if error.is_timeout() {
+        "provider request timed out".into()
+    } else {
+        "provider request failed".into()
+    }
+}
+
+fn live_request_body(compact_request: &Value, model: &str) -> AppResult<Value> {
+    let mut body = compact_request
+        .as_object()
+        .cloned()
+        .ok_or_else(|| "compact request must be a JSON object".to_string())?;
+    body.insert("model".into(), Value::String(model.to_string()));
+    if model.starts_with("openai.gpt-5.6-") {
+        body.remove("temperature");
+    } else {
+        body.insert("temperature".into(), json!(0));
+    }
+    Ok(Value::Object(body))
 }
 
 impl LiveOutcome {
@@ -680,6 +726,28 @@ mod tests {
             cases: vec![],
             decoder_cases: vec![],
         }
+    }
+
+    #[test]
+    fn bedrock_gpt_56_live_request_omits_temperature() {
+        let request = live_request_body(
+            &json!({
+                "temperature": 0.7,
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+            "openai.gpt-5.6-luna",
+        )
+        .unwrap();
+        assert!(request.get("temperature").is_none());
+    }
+
+    #[test]
+    fn provider_endpoint_preserves_openai_v1_prefix() {
+        let endpoint = chat_completions_url("https://example.test/openai/v1").unwrap();
+        assert_eq!(
+            endpoint.as_str(),
+            "https://example.test/openai/v1/chat/completions"
+        );
     }
 
     #[test]
